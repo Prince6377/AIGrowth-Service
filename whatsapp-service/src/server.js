@@ -11,9 +11,26 @@ const whatsappRoutes = require('./routes/whatsapp.routes');
 
 const app = express();
 
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  if (config.corsOrigins.includes(origin)) return true;
+
+  try {
+    const url = new URL(origin);
+    const isLocalHost = ['localhost', '127.0.0.1'].includes(url.hostname);
+    const port = Number(url.port);
+    return isLocalHost && port >= 3000 && port <= 3099;
+  } catch {
+    return false;
+  }
+}
+
 // ── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
+  origin(origin, callback) {
+    if (isAllowedOrigin(origin)) return callback(null, true);
+    return callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
@@ -65,4 +82,3 @@ app.listen(config.port, () => {
 });
 
 module.exports = app;
-

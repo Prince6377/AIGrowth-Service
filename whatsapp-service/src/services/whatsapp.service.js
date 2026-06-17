@@ -32,6 +32,19 @@ async function getWAVersion() {
   return _cachedVersion;
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForSessionQR(session, timeoutMs = 10000) {
+  const startedAt = Date.now();
+  while (session && session.status !== 'connected' && Date.now() - startedAt < timeoutMs) {
+    if (session.qr) return session.qr;
+    await delay(300);
+  }
+  return session?.qr || null;
+}
+
 /** Returns true for JIDs that should never become dashboard chats. */
 function isJunkJid(jid = '') {
   return !jid || jid === 'status@broadcast' || isJidBroadcast(jid) || isJidGroup(jid) || jid.endsWith('@newsletter');
@@ -73,6 +86,10 @@ function isPhoneJid(jid = '') {
 function phoneToJid(phone = '') {
   const digits = String(phone || '').replace(/\D/g, '');
   return digits ? `${digits}@s.whatsapp.net` : '';
+}
+
+function isLikelyInternationalPhone(digits = '') {
+  return /^\d{11,15}$/.test(digits);
 }
 
 function firstTruthy(...values) {
@@ -201,11 +218,17 @@ function resolveSendJid(sessionData, phone = '', chatJid = '') {
     if (isLidJid(normalizedPhone)) {
       return sessionData.lidToPhoneMap.get(normalizedPhone) || normalizedPhone;
     }
+    if (isPhoneJid(normalizedPhone) && !isLikelyInternationalPhone(jidToPhone(normalizedPhone))) {
+      throw new Error('Country code is required for WhatsApp numbers');
+    }
     return normalizedPhone;
   }
 
   const digits = normalizedPhone.replace(/\D/g, '');
   if (digits) {
+    if (!isLikelyInternationalPhone(digits)) {
+      throw new Error('Country code is required for WhatsApp numbers');
+    }
     const possibleLid = `${digits}@lid`;
     const mappedPhoneJid = sessionData.lidToPhoneMap.get(possibleLid);
     if (mappedPhoneJid) return mappedPhoneJid;
@@ -303,6 +326,7 @@ async function pushInboundMessage(userId, {
   is_from_me = false,
   increment_unread = true,
 }) {
+  const timestampIso = timestamp ? new Date(timestamp * 1000).toISOString() : new Date().toISOString();
   try {
     await axios.post(
       `${config.djangoApiUrl}/api/conversations/inbound-message/`,
@@ -315,7 +339,7 @@ async function pushInboundMessage(userId, {
         content,
         whatsapp_message_id: messageId,
         message_type: messageType,
-        timestamp: timestamp ? new Date(timestamp * 1000).toISOString() : new Date().toISOString(),
+        timestamp: timestampIso,
         is_from_me,
         increment_unread,
       },
@@ -323,6 +347,26 @@ async function pushInboundMessage(userId, {
     );
   } catch (err) {
     logger.error({ err, userId, chatId }, 'Failed to push inbound message to Django');
+  }
+
+  try {
+    await axios.post(
+      `${config.djangoApiUrl}/api/agency/internal/client-lead-inbound-message/`,
+      {
+        user_id: userId,
+        contact_name: contactName || '',
+        contact_number: contactNumber || '',
+        content,
+        whatsapp_message_id: messageId,
+        message_type: messageType,
+        timestamp: timestampIso,
+        is_from_me,
+        source_whatsapp_chat_id: sourceChatId || chatId,
+      },
+      { headers: internalHeaders(), timeout: 8000 },
+    );
+  } catch (err) {
+    logger.debug({ err, userId, chatId }, 'No app-started agency lead thread matched this WhatsApp message');
   }
 }
 
@@ -376,10 +420,6 @@ async function pushBaileysMessageToDjango(userId, sessionData, msg, { incrementU
   const isFromMe = Boolean(msg.key.fromMe);
   const contactNumber = isPhoneJid(chatId) ? jidToPhone(chatId) : contact.number;
 
-  console.log(
-    `  message ${messageId} ${isFromMe ? 'outgoing' : 'incoming'} ${contactNumber}: "${payload.content.slice(0, 60)}"`,
-  );
-
   await pushInboundMessage(userId, {
     chatId,
     sourceChatId,
@@ -428,7 +468,7 @@ async function initSession(userId) {
     shouldIgnoreJid: (jid) => isJunkJid(jid),
     keepAliveIntervalMs: 30_000,
     syncFullHistory: false,
-    shouldSyncHistoryMessage: () => true, // ENABLED to get recent offline history chunk (last 24h)
+    shouldSyncHistoryMessage: () => false,
     markOnlineOnConnect: true, // Go online immediately, skip AwaitingInitialSync
     fireInitQueries: true,
     generateHighQualityLinkPreview: false,
@@ -459,17 +499,12 @@ async function initSession(userId) {
     if (connection === 'open') {
       const phoneNumber = sock.user?.id ? jidToPhone(sock.user.id) : '';
       console.log(`\n✅ CONNECTED! Phone: ${phoneNumber}`);
-      console.log(`   Now waiting for chat list from WhatsApp...\n`);
+      console.log(`   WhatsApp is ready for app-started conversations.\n`);
       session.status = 'connected';
       session.phoneNumber = phoneNumber;
       session.qr = null;
 
       await notifyDjango({ userId, connected: true, phoneNumber, sessionId });
-      setTimeout(() => {
-        syncStoreChatsToDjango(userId, sessionData).catch((err) => {
-          logger.error({ err, userId }, 'Failed to sync Baileys store chats after connect');
-        });
-      }, 1500);
     }
 
     if (connection === 'close') {
@@ -526,7 +561,7 @@ async function initSession(userId) {
     }
 
     // ONLY sync the chat list — no messages, no heavy processing
-    if (chats.length > 0) {
+    if (false && chats.length > 0) {
       for (const c of chats) {
         if (c.id) sessionData.chatMap.set(c.id, c);
       }
@@ -541,6 +576,12 @@ async function initSession(userId) {
         console.log(`  ✅ Synced ${chatPayloads.length} chats to Django`);
       }
     }
+
+    logger.info(
+      { userId, chats: chats.length, contacts: contacts.length, messages: messages.length, isLatest },
+      'Ignored WhatsApp history chunk',
+    );
+    return;
 
     const historyMessages = messages
       .filter(m => m?.key?.remoteJid && !isJunkJid(m.key.remoteJid))
@@ -662,6 +703,9 @@ async function getQR(userId) {
     session = sessions.get(key);
   }
   if (!session) throw new Error('Failed to initialize session');
+  if (!session.qr && session.status !== 'connected') {
+    await waitForSessionQR(session);
+  }
   return { status: session.status, qr: session.qr || null };
 }
 
